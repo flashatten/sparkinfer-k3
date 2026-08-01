@@ -162,11 +162,43 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
                      tp::backend_name(out.coll->backend()));
         return false;
     }
-    // Owned-buffer backends are no longer refused: allreduce_f32_group on the
-    // adapter stages the caller's buffers through the collective-owned ones
-    // itself (two stream-ordered ~14 KB D2D copies per rank, ~2 us each), so
-    // from this forward's point of view the call is Mode A. supports_f32 above
-    // remains the gate that matters; a backend that passes it can be driven.
+    // Owned-buffer backends run Mode B proper: phase partials are aimed at
+    // reduce_in() and consumed from reduce_out() (see the swap calls in the
+    // forward), so no staging copies exist on the collective path. supports_f32
+    // above remains the gate that matters; a backend that passes it can be driven.
+    const bool host_reduce_dbg = [] {
+        const char* e = std::getenv("SPARKINFER_K3_TP_HOST_REDUCE");
+        return e && e[0] == '1';
+    }();
+    if (out.coll->owns_buffers() && !host_reduce_dbg) {
+        const size_t need = out.shard_attn
+            ? (size_t)(cfg.hidden > cfg.expert_latent ? cfg.hidden : cfg.expert_latent)
+            : (size_t)cfg.expert_latent;
+        if (out.coll->max_count() >= need) {
+            const int n = (int)out.ranks.size();
+            out.zc_in.resize((size_t)n); out.zc_out.resize((size_t)n);
+            out.orig_attn.resize((size_t)n); out.orig_moe.resize((size_t)n);
+            for (int r = 0; r < n; ++r) {
+                out.zc_in[(size_t)r]  = (float*)out.coll->reduce_in(r);
+                out.zc_out[(size_t)r] = (float*)out.coll->reduce_out(r);
+                out.orig_attn[(size_t)r] = kimi_k3_partial_buffer(
+                    out.ranks[(size_t)r].fwd, 0, K3LayerPhase::Attn, nullptr);
+                out.orig_moe[(size_t)r] = kimi_k3_partial_buffer(
+                    out.ranks[(size_t)r].fwd, cfg.leading_dense,
+                    K3LayerPhase::FfnPartial, nullptr);
+                if (!out.zc_in[(size_t)r] || !out.zc_out[(size_t)r] ||
+                    !out.orig_attn[(size_t)r] || !out.orig_moe[(size_t)r]) {
+                    out.zc_in.clear(); out.zc_out.clear();
+                    out.orig_attn.clear(); out.orig_moe.clear();
+                    break;
+                }
+            }
+            out.zero_copy = !out.zc_in.empty();
+        }
+        if (out.zero_copy)
+            std::fprintf(stderr, "[k3-tp] f32 zero-copy: phase partials write the "
+                                 "collective's peer buffers directly (no staging)\n");
+    }
     return true;
 }
 
@@ -223,6 +255,12 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 cudaMemcpy(p.reduce_bufs[(size_t)r], sum.data(),
                            (size_t)count * sizeof(float), cudaMemcpyHostToDevice);
             }
+        } else if (p.zero_copy) {
+            // The partials are ALREADY in reduce_in() — the swap before the
+            // phase aimed them there — so this launches the reduce with no
+            // staging copies. The gather above still ran: it is what validates
+            // the width every rank agrees on.
+            if (!p.coll->allreduce_f32_owned((size_t)count, p.streams)) return false;
         } else if (!p.coll->allreduce_f32_group(p.reduce_bufs, (size_t)count, p.streams)) {
             return false;
         }
@@ -230,10 +268,25 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
         return true;
     };
 
+    // Zero-copy pointer choreography, two swaps per reduced phase: partials are
+    // produced into reduce_in(r) and consumed from reduce_out(r). Reusing one
+    // in/out pair for all 185 collectives is race-free: the one-shot kernel's
+    // exit barrier proves every peer finished reading this rank's input, and all
+    // later writes are stream-ordered behind that kernel on this rank's stream.
+    auto aim_at_in = [&](K3LayerPhase phase) {
+        for (std::size_t r = 0; r < p.ranks.size(); ++r)
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, phase, p.zc_in[r]);
+    };
+    auto aim_at_out = [&](K3LayerPhase phase) {
+        for (std::size_t r = 0; r < p.ranks.size(); ++r)
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, phase, p.zc_out[r]);
+    };
+
     for (int layer = 0; layer < cfg.n_layers; ++layer) {
         const bool is_moe = layer >= cfg.leading_dense;
 
         // --- phase 1 on every rank ------------------------------------------
+        if (p.zero_copy && p.shard_attn) aim_at_in(K3LayerPhase::Attn);
         for (auto& R : p.ranks) {
             if (cudaSetDevice(R.device) != cudaSuccess) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::Attn,
@@ -255,9 +308,17 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                              layer);
                 return false;
             }
+            // Phase 2's residual add reads the reduced attention sum where the
+            // collective wrote it.
+            if (p.zero_copy) aim_at_out(K3LayerPhase::Attn);
         }
 
         // --- phase 2 on every rank ------------------------------------------
+        // The MoE accumulator aims at reduce_in while the attention sum is being
+        // read from reduce_out — distinct buffers, and the attention partial that
+        // previously occupied reduce_in is dead (every peer's read of it
+        // completed before the attention reduce's exit barrier released).
+        if (p.zero_copy && is_moe && tp_size > 1) aim_at_in(K3LayerPhase::FfnPartial);
         for (auto& R : p.ranks) {
             if (cudaSetDevice(R.device) != cudaSuccess) return false;
             if (!kimi_k3_forward_layer_phase(R.fwd, layer, K3LayerPhase::FfnPartial,
@@ -273,6 +334,10 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
                 std::fprintf(stderr, "[k3-tp] all-reduce failed at layer %d\n", layer);
                 return false;
             }
+            // Phase 3's routed_norm reads (and normalises in place) the reduced
+            // expert sum where the collective wrote it. In-place writes to
+            // reduce_out are rank-private: peers only ever read inputs.
+            if (p.zero_copy) aim_at_out(K3LayerPhase::FfnPartial);
         }
 
         // --- phase 3 on every rank ------------------------------------------
@@ -315,6 +380,18 @@ bool kimi_k3_tp_forward_token(KimiK3TP& p, int token_id, float* out_logits) {
 }
 
 void kimi_k3_tp_free(KimiK3TP& p) {
+    // Point the scratch fields back at scratch before teardown. Not load-bearing
+    // today (scratch frees via its owned list, not these fields) but keeps the
+    // structs truthful for anything that walks them during shutdown.
+    if (p.zero_copy) {
+        for (std::size_t r = 0; r < p.ranks.size(); ++r) {
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::Attn,
+                                        p.orig_attn[r]);
+            kimi_k3_swap_partial_buffer(p.ranks[r].fwd, K3LayerPhase::FfnPartial,
+                                        p.orig_moe[r]);
+        }
+        p.zero_copy = false;
+    }
     for (auto& R : p.ranks) {
         cudaSetDevice(R.device);
         if (R.x) cudaFree(R.x);
@@ -328,6 +405,10 @@ void kimi_k3_tp_free(KimiK3TP& p) {
     p.ranks.clear();
     p.streams.clear();
     p.reduce_bufs.clear();
+    p.zc_in.clear();
+    p.zc_out.clear();
+    p.orig_attn.clear();
+    p.orig_moe.clear();
     p.coll.reset();
 }
 

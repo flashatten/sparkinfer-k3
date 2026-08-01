@@ -80,6 +80,16 @@ struct KimiK3TP {
     long n_collectives = 0;              // counted, so a run can assert it saw the
                                          // expected 92 or 185 per token
     bool shard_attn = false;             // each rank owns a band of the query heads
+
+    // Mode-B zero-copy: with an owned-buffer f32 backend, phase partials are
+    // written into the collective's reduce_in() and consumed from reduce_out()
+    // directly (kimi_k3_swap_partial_buffer), skipping both staging copies of
+    // every collective. Off for NCCL (Mode A reduces in place already) and under
+    // SPARKINFER_K3_TP_HOST_REDUCE=1 (the debug path sums the swapped-in
+    // pointers and would leave reduce_out() unwritten).
+    bool zero_copy = false;
+    std::vector<float*> zc_in, zc_out;         // reduce_in/out, rank order
+    std::vector<float*> orig_attn, orig_moe;   // scratch pointers, restored at free
 };
 
 // Load the model once per rank, banding the routed experts. `devices` gives tp_size.
