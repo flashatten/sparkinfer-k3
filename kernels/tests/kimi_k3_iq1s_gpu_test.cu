@@ -314,6 +314,32 @@ int main() {
             if (!bok || !(brl2 < 2e-5) || !(bden > 0) || nonfinite) ++g_fail;
         }
 
+        // ALL selections foreign. At tp=8 a rank's band holds 112 of 896 experts, so
+        // every one of the 16 picks landing outside it happens for ~12% of tokens —
+        // a routine case, not a corner. The dispatch owes the output EXACT zeros
+        // (+0.0f: the all-reduce then contributes nothing from this rank), and the
+        // scratch is poisoned first so a slot that is read rather than skipped
+        // surfaces as NaN instead of drifting.
+        {
+            std::vector<float> poison((size_t)TOPK*FFN, std::nanf(""));
+            CU(cudaMemcpy(dscr, poison.data(), poison.size()*4, cudaMemcpyHostToDevice));
+            CU(cudaMemset(dout, 0xFF, LAT*4));   // pre-fill with NaN pattern, not zeros
+            const bool fok = moe_expert_ffn_f32_by_type(
+                dout, dscr, dx, did, dw, dg, du, dd, LAT, FFN, TOPK, beta, lb,
+                /*ggml_type=*/19, 0, /*expert_begin=*/100, /*n_local_experts=*/1);
+            CU(cudaDeviceSynchronize());
+            CU(cudaMemcpy(got.data(), dout, LAT*4, cudaMemcpyDeviceToHost));
+            int nonzero = 0, negzero = 0;
+            for (int i = 0; i < LAT; ++i) {
+                uint32_t bits; std::memcpy(&bits, &got[i], 4);
+                if (bits == 0x80000000u) ++negzero;      // -0.0f would flip the reduce
+                else if (bits != 0u) ++nonzero;
+            }
+            std::printf("    all-foreign band             : nonzero = %d  negzero = %d (%s)\n",
+                        nonzero, negzero, fok ? "accepted" : "REFUSED");
+            if (!fok || nonzero || negzero) ++g_fail;
+        }
+
         // An unknown type must be REFUSED, not silently decoded with the wrong reader.
         const bool bad = moe_expert_ffn_f32_by_type(dout, dscr, dx, did, dw, dg, du, dd,
                                                     LAT, FFN, TOPK, beta, lb, 12, 0);
