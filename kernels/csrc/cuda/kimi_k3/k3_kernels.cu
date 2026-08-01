@@ -1314,6 +1314,141 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
     }
 }
 
+// Same split, but the K tile is STAGED and shared by a group of heads.
+//
+// The split kernel above reads k_cache TWICE per position: key_length floats for the score
+// dot product, then the first kv_lora of the SAME position again for the latent
+// accumulation. 1088 floats fetched where 576 are unique — 1.89x, inside one block.
+//
+// And it reads them once PER HEAD. MLA is stored MQA (head_count_kv = 1), so all 96 query
+// heads attend to byte-identical K. One block per head means the same bytes are pulled 96
+// times per layer; at 128k that is 302 MB of cache restreamed 96 times.
+//
+// Staging fixes both at once, because once a tile is in shared memory the marginal cost of
+// applying another head to it is only arithmetic. Traffic drops by 1.89 x kMlaHeadGroup.
+// This is the same reuse argument multirow made for the projection GEMV's activation, one
+// level up: the operand every block re-reads costs its size times the block count.
+//
+// The tile is small (8) on purpose. Shared memory here is charged per BLOCK, not per head,
+// so it trades directly against occupancy: at kMlaStageTile 8 and kMlaHeadGroup 4 the
+// footprint is ~35 KB, under the 48 KB default limit, so no opt-in is needed and 6 CTAs
+// still fit per SM. A larger tile would buy fewer online-softmax rescales and cost more
+// than it saves.
+constexpr int kMlaHeadGroup = 4;
+constexpr int kMlaStageTile = 8;
+
+template <int BLOCK>
+__global__ void mla_decode_attn_split_hs_kernel(float* __restrict__ part_acc,
+                                                float* __restrict__ part_ml,
+                                                const float* __restrict__ q,
+                                                const float* __restrict__ k_cache,
+                                                int key_length, int kv_lora,
+                                                int n_ctx, float scale, int splits,
+                                                int n_head) {
+    constexpr int NWARP = BLOCK / 32;
+    const int h0   = blockIdx.x * kMlaHeadGroup;
+    const int sp   = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int chunk = (n_ctx + splits - 1) / splits;
+    const int t_beg = sp * chunk;
+    const int t_end = min(n_ctx, t_beg + chunk);
+
+    extern __shared__ float smem[];
+    float* s_k   = smem;                                    // kMlaStageTile * key_length
+    float* s_q   = s_k   + kMlaStageTile * key_length;      // kMlaHeadGroup * key_length
+    float* s_acc = s_q   + kMlaHeadGroup * key_length;      // kMlaHeadGroup * kv_lora
+    float* s_p   = s_acc + kMlaHeadGroup * kv_lora;         // kMlaHeadGroup * kMlaStageTile
+    float* red   = s_p   + kMlaHeadGroup * kMlaStageTile;   // BLOCK/32 + 1
+
+    // A tail group (n_head not a multiple of kMlaHeadGroup) zero-fills its q so the
+    // absent head's scores are finite and its partial is discarded by the store guard.
+#pragma unroll
+    for (int hh = 0; hh < kMlaHeadGroup; ++hh) {
+        const int h = h0 + hh;
+        const float* qh = q + (size_t)h * key_length;
+        for (int d = threadIdx.x; d < key_length; d += BLOCK)
+            s_q[hh * key_length + d] = (h < n_head) ? qh[d] : 0.0f;
+    }
+    for (int i = threadIdx.x; i < kMlaHeadGroup * kv_lora; i += BLOCK) s_acc[i] = 0.0f;
+    __syncthreads();
+
+    float m[kMlaHeadGroup], l[kMlaHeadGroup];
+#pragma unroll
+    for (int hh = 0; hh < kMlaHeadGroup; ++hh) { m[hh] = -1e30f; l[hh] = 0.0f; }
+
+    for (int t0 = t_beg; t0 < t_end; t0 += kMlaStageTile) {
+        const int tn = min(kMlaStageTile, t_end - t0);
+
+        // ---- the one read of k_cache. Everything below works out of shared memory. ----
+        for (int t = 0; t < tn; ++t) {
+            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            for (int d = threadIdx.x; d < key_length; d += BLOCK)
+                s_k[t * key_length + d] = kt[d];
+        }
+        __syncthreads();
+
+        // ---- scores for every head in the group against the staged tile ----
+        for (int j = warp; j < kMlaHeadGroup * tn; j += NWARP) {
+            const int hh = j / tn, t = j - hh * tn;
+            const float* kt = s_k + t * key_length;
+            const float* qh = s_q + hh * key_length;
+            float sdot = 0.0f;
+            for (int d = lane; d < key_length; d += 32) sdot += qh[d] * kt[d];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                sdot += __shfl_down_sync(0xffffffff, sdot, off);
+            if (lane == 0) s_p[hh * kMlaStageTile + t] = sdot * scale;
+        }
+        __syncthreads();
+
+        // ---- per-head online softmax, identical in form to the one-head kernel ----
+#pragma unroll
+        for (int hh = 0; hh < kMlaHeadGroup; ++hh) {
+            float* sp = s_p + hh * kMlaStageTile;
+            float tm = -1e30f;
+            for (int t = threadIdx.x; t < tn; t += BLOCK) tm = fmaxf(tm, sp[t]);
+            tm = block_max<BLOCK>(tm, red);
+            const float m_new = fmaxf(m[hh], tm);
+            const float corr  = __expf(m[hh] - m_new);
+
+            float ls = 0.0f;
+            for (int t = threadIdx.x; t < tn; t += BLOCK) {
+                const float e = __expf(sp[t] - m_new);
+                sp[t] = e;
+                ls += e;
+            }
+            ls = block_sum<BLOCK>(ls, red);
+            l[hh] = l[hh] * corr + ls;
+            m[hh] = m_new;
+            __syncthreads();
+
+            float* acc = s_acc + hh * kv_lora;
+            for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
+                float a = acc[r] * corr;
+                for (int t = 0; t < tn; ++t) a += sp[t] * s_k[t * key_length + r];
+                acc[r] = a;
+            }
+            __syncthreads();
+        }
+    }
+
+#pragma unroll
+    for (int hh = 0; hh < kMlaHeadGroup; ++hh) {
+        const int h = h0 + hh;
+        if (h >= n_head) continue;
+        float* pa = part_acc + ((size_t)h * splits + sp) * kv_lora;
+        const float* acc = s_acc + hh * kv_lora;
+        for (int r = threadIdx.x; r < kv_lora; r += BLOCK) pa[r] = acc[r];
+        if (threadIdx.x == 0) {
+            float* pm = part_ml + ((size_t)h * splits + sp) * 2;
+            pm[0] = (t_end > t_beg) ? m[hh] : -1e30f;
+            pm[1] = (t_end > t_beg) ? l[hh] : 0.0f;
+        }
+    }
+}
+
 // Merge the per-slice partials, normalise, then project through wv_b.
 template <int BLOCK>
 __global__ void mla_decode_combine_kernel(float* __restrict__ out,
@@ -2056,10 +2191,24 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         return;
     }
 
-    dim3 grid((unsigned)n_head, (unsigned)splits);
-    mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
-        g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
-        n_ctx, scale, splits);
+    // Head-shared path when the group divides the head count and its shared-memory
+    // footprint stays inside the 48 KB default limit — at K3's dims that is ~35 KB. The
+    // fallback is not dead code: it is what runs for any other model shape, and it is the
+    // kernel the split path was validated on.
+    const size_t hs_shm = ((size_t)kMlaStageTile * key_length +
+                           (size_t)kMlaHeadGroup * (key_length + kv_lora + kMlaStageTile) +
+                           BLOCK / 32 + 1) * sizeof(float);
+    if (n_head % kMlaHeadGroup == 0 && hs_shm <= 48u * 1024u) {
+        dim3 hgrid((unsigned)(n_head / kMlaHeadGroup), (unsigned)splits);
+        mla_decode_attn_split_hs_kernel<BLOCK><<<hgrid, BLOCK, hs_shm, stream>>>(
+            g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
+            n_ctx, scale, splits, n_head);
+    } else {
+        dim3 grid((unsigned)n_head, (unsigned)splits);
+        mla_decode_attn_split_kernel<BLOCK><<<grid, BLOCK, shm, stream>>>(
+            g_mla_part_acc[dev], g_mla_part_ml[dev], q, k_cache, key_length, kv_lora,
+            n_ctx, scale, splits);
+    }
     // s_acc + s_w, where s_w needs splits + 1 slots (the last holds 1/l).
     const size_t cshm = ((size_t)kv_lora + (size_t)splits + 1) * sizeof(float);
     mla_decode_combine_kernel<BLOCK><<<(unsigned)n_head, BLOCK, cshm, stream>>>(
