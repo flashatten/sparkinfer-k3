@@ -484,6 +484,42 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 // 13. Latent MoE expert dispatch
 // ---------------------------------------------------------------------------
 
+// THE CODEPOINT TABLE, AND WHY IT WANTS TO BE IN SHARED MEMORY.
+//
+// Both low-bit expert formats decode through a lattice lookup: IQ1_S maps an 11-bit
+// codepoint to one uint64 of 8 packed int8, IQ2_XS a 9-bit one. The index is derived
+// from the weight bits, so it is DIFFERENT IN EVERY LANE — a 32-way divergent gather,
+// once per 256-value block, in the innermost loop of the whole MoE dispatch.
+//
+// From __device__ memory that costs one L1 transaction per distinct address: up to 32
+// sectors to deliver 32 useful uint64. Against IQ1_S's 50 bytes of actual weight per
+// block, the lookup that exists to decode the weights moves an order of magnitude more
+// through L1 than the weights do.
+//
+// The tables are small enough to stage: 16 KB for IQ1_S, 4 KB + 128 B for IQ2_XS. A CTA
+// pays that once and then serves every gather from shared memory, where a divergent
+// access costs bank conflicts rather than cache-line fetches. In gate/up one CTA does
+// 8 warps x 28 block_dots x 32 lanes = 7168 gathers, so the staging is amortised ~900x.
+//
+// It is free in occupancy terms, which is the part that has to be checked rather than
+// assumed: both MoE kernels are register-bound (48 and 32 registers, 5 and 8 CTAs/SM),
+// and 16 KB of shared memory admits 14 CTAs/SM. Registers still bind, so nothing is lost.
+struct MoeTables {
+    const uint64_t* __restrict__ grid;    // lattice: 2048 entries IQ1_S, 512 IQ2_XS
+    const uint8_t*  __restrict__ signs;   // IQ2_XS only; nullptr for IQ1_S
+};
+
+// Where each format's table lives when it has NOT been staged. Overloaded on a null
+// block pointer so the kernels below stay written once and get the right table.
+__device__ __forceinline__ const uint64_t* moe_global_grid(const BlockIQ1S*)  { return iq1s_grid_c; }
+__device__ __forceinline__ const uint64_t* moe_global_grid(const BlockIQ2XS*) { return c_iq2xs_grid; }
+__device__ __forceinline__ const uint8_t*  moe_global_signs(const BlockIQ1S*) { return nullptr; }
+__device__ __forceinline__ const uint8_t*  moe_global_signs(const BlockIQ2XS*){ return c_ksigns_iq2xs; }
+
+template <typename Blk> struct MoeGridSize;
+template <> struct MoeGridSize<BlockIQ1S>  { static const int NGRID = SPARKINFER_IQ1S_NGRID; static const int NSIGN = 1;   };
+template <> struct MoeGridSize<BlockIQ2XS> { static const int NGRID = 512;                   static const int NSIGN = 128; };
+
 // Decode one IQ2_XS block (256 values) into the caller's dot accumulator against
 // `x`. Same arithmetic as dequant_iq2_xs_kernel — kept in one place so the two
 // cannot drift, since that kernel is the one validated bit-exact against ggml.
@@ -498,7 +534,8 @@ __global__ void moe_router_noaux_tc_kernel(float* __restrict__ out_w,
 template <bool XVEC>
 __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
                                                  const float* __restrict__ x,
-                                                 int lane, int nlanes) {
+                                                 int lane, int nlanes,
+                                                 const MoeTables t) {
     const float d = __half2float(__ushort_as_half(b.d));
     float acc = 0.0f;
     // 32 groups of 8 values per block; spread them over the lanes.
@@ -508,9 +545,9 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
         const float db = (sub < 2) ? d * (0.5f + (float)(sc & 0xf)) * 0.25f
                                    : d * (0.5f + (float)(sc >> 4))  * 0.25f;
         const uint16_t q = b.qs[l];
-        const uint64_t gw = c_iq2xs_grid[q & 511];
-        const uint8_t* grid = (const uint8_t*)&c_iq2xs_grid[q & 511];
-        const uint8_t signs = c_ksigns_iq2xs[q >> 9];
+        const uint64_t gw = t.grid[q & 511];
+        const uint8_t* grid = (const uint8_t*)&t.grid[q & 511];
+        const uint8_t signs = t.signs[q >> 9];
         const float* xv = x + l * 8;
         if (XVEC) {
             const float4* xv4 = (const float4*)xv;
@@ -540,7 +577,8 @@ __device__ __forceinline__ float block_dot(const BlockIQ2XS& b,
 template <bool XVEC>
 __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
                                            const float* __restrict__ x,
-                                           int lane, int nlanes) {
+                                           int lane, int nlanes,
+                                           const MoeTables t) {
     const float d = __half2float(__ushort_as_half(b.d));
     float acc = 0.0f;
     for (int l32 = lane; l32 < 32; l32 += nlanes) {
@@ -555,7 +593,7 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
             // The table IS a uint64 per codepoint, so read it as one -- the byte
             // pointer form makes the compiler emit eight dependent 1-byte loads off a
             // divergent address.
-            const uint64_t gw = iq1s_grid_c[idx];
+            const uint64_t gw = t.grid[idx];
             const float4* xv4 = (const float4*)xv;
             const float4 xa = xv4[0], xb = xv4[1];
             const float xs[8] = { xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w };
@@ -565,7 +603,7 @@ __device__ __forceinline__ float block_dot(const BlockIQ1S& b,
                 acc += dl * ((float)gj + delta) * xs[j];
             }
         } else {
-            const int8_t* grid = (const int8_t*)&iq1s_grid_c[idx];
+            const int8_t* grid = (const int8_t*)&t.grid[idx];
         #pragma unroll
             for (int j = 0; j < 8; ++j) acc += dl * ((float)grid[j] + delta) * xv[j];
         }
@@ -663,15 +701,39 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     const int warp = threadIdx.x >> 5;
     const int k = blockIdx.y;                                  // which selected expert
     const int j = blockIdx.x * WARPS_PER_CTA + warp;           // which ffn output row
-    if (j >= ffn) return;
 
     // EXPERT PARALLELISM. `ids` holds GLOBAL expert indices — every rank's router
     // sees the same replicated ffn_gate_inp and therefore selects the same top_k —
     // but this rank stores only experts [expert_begin, expert_begin+n_local).
     // Selections outside that band belong to another rank and contribute ZERO here;
     // the all-reduce that follows sums the bands back into the full top_k combine.
+    //
+    // Tested BEFORE the staging below, and the ordering is load-bearing in both
+    // directions. `e` depends only on blockIdx.y, so this return is CTA-UNIFORM —
+    // every thread takes it or none does, which is what makes returning ahead of a
+    // __syncthreads() legal. And at tp=8, 14 of every 16 CTAs take it: staging first
+    // would have those CTAs each pull a 16 KB table just to throw it away.
     const int e = ids[k] - expert_begin;
     if (e < 0 || e >= n_local_experts) return;   // memset already left this slot at 0
+
+    // Stage the lattice once per CTA; every gather below then hits shared memory
+    // instead of issuing a 32-way divergent L1 gather per 256-value block. This sits
+    // BEFORE the `j >= ffn` return: that test is per-WARP (j is derived from `warp`),
+    // so warps can take it divergently, and a barrier some warps never reach is
+    // undefined. Every thread stages and syncs, then the tail warps exit.
+    __shared__ uint64_t s_grid[MoeGridSize<Blk>::NGRID];
+    __shared__ uint8_t  s_sign[MoeGridSize<Blk>::NSIGN];
+    {
+        const uint64_t* g = moe_global_grid((const Blk*)nullptr);
+        for (int i = threadIdx.x; i < MoeGridSize<Blk>::NGRID; i += blockDim.x) s_grid[i] = g[i];
+        const uint8_t* sg = moe_global_signs((const Blk*)nullptr);
+        if (sg) for (int i = threadIdx.x; i < MoeGridSize<Blk>::NSIGN; i += blockDim.x) s_sign[i] = sg[i];
+    }
+    __syncthreads();
+    const MoeTables tabs = { s_grid, s_sign };
+
+    if (j >= ffn) return;
+
     const int blocks_per_row = latent / 256;
 
     const Blk* g_row = gate_exps + (size_t)(e * ffn + j) * blocks_per_row;
@@ -680,8 +742,8 @@ __global__ void moe_gate_up_situ_kernel(float* __restrict__ scratch,
     float gacc = 0.0f, uacc = 0.0f;
     for (int b = 0; b < blocks_per_row; ++b) {
         const float* xb = x + b * 256;
-        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32);
-        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32);
+        gacc += block_dot<XVEC>(g_row[b], xb, lane, 32, tabs);
+        uacc += block_dot<XVEC>(u_row[b], xb, lane, 32, tabs);
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -739,6 +801,35 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
     const int blocks_per_row = ffn / 256;
     extern __shared__ float partial[];        // top_k floats
 
+    // All-foreign early-out. At tp=8 a rank's band holds 112 of 896 experts, so the
+    // chance that NONE of the 16 selections is local is (7/8)^16 ~= 12% — not a corner
+    // case. Those CTAs owe the output exactly one zero; staging a 16 KB table first
+    // would be pure waste. The scan reads the same 16 ids in every thread, so the
+    // branch is CTA-uniform and returning before the barrier below is legal. The zero
+    // written is +0.0f, exactly what the fold's empty skip-sum produced before.
+    bool any_local = false;
+    for (int kk = 0; kk < top_k; ++kk) {
+        const int ek = ids[kk] - expert_begin;
+        if (ek >= 0 && ek < n_local_experts) { any_local = true; break; }
+    }
+    if (!any_local) {
+        if (threadIdx.x == 0) out[o] = 0.0f;
+        return;
+    }
+
+    // Stage the lattice once per CTA; every gather below then hits shared memory
+    // instead of issuing a 32-way divergent L1 gather per 256-value block.
+    __shared__ uint64_t s_grid[MoeGridSize<Blk>::NGRID];
+    __shared__ uint8_t  s_sign[MoeGridSize<Blk>::NSIGN];
+    {
+        const uint64_t* g = moe_global_grid((const Blk*)nullptr);
+        for (int i = threadIdx.x; i < MoeGridSize<Blk>::NGRID; i += blockDim.x) s_grid[i] = g[i];
+        const uint8_t* sg = moe_global_signs((const Blk*)nullptr);
+        if (sg) for (int i = threadIdx.x; i < MoeGridSize<Blk>::NSIGN; i += blockDim.x) s_sign[i] = sg[i];
+    }
+    __syncthreads();
+    const MoeTables tabs = { s_grid, s_sign };
+
     for (int k = warp; k < top_k; k += WARPS_PER_CTA) {
         // Same band test as the gate/up pass. Skipping here is what keeps the read
         // in bounds: down_exps holds n_local experts, so indexing it by a GLOBAL id
@@ -750,7 +841,7 @@ __global__ void moe_down_combine_kernel(float* __restrict__ out,
         const float* act = scratch + (size_t)k * ffn;
         float acc = 0.0f;
         for (int b = 0; b < blocks_per_row; ++b)
-            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32);
+            acc += block_dot<XVEC>(d_row[b], act + b * 256, lane, 32, tabs);
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
         if (lane == 0) partial[k] = acc;      // RAW; w[k] is applied in the fold
