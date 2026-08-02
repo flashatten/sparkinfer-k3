@@ -21,6 +21,7 @@
 
 #include "sparkinfer/kernels/kimi_k3.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>

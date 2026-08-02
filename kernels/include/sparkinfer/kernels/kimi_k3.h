@@ -25,6 +25,7 @@
 // independent float64 CPU implementation of the same formula.
 
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace sparkinfer {
