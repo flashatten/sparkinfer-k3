@@ -413,14 +413,28 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
 // past that quietly reused the previous token's output. Any future rewrite that
 // reintroduces an n_ctx-sized shared buffer reintroduces that.
 //
-// q:       [key_length, n_head]     (output of mla_absorb_q_f32)
-// k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads)
-// wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest
-// out:     [v_dim, n_head]
-void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+// THE CACHE IS HALF, THE ARITHMETIC IS NOT. k_cache rows are __half; every load is
+// widened to float at the register and every accumulator — score, running max,
+// running exp-sum, latent — stays f32. The cache is the model's largest live buffer
+// and its largest per-token read, and it is the one place where narrowing costs
+// almost nothing: a cached latent is about to be multiplied by a softmax weight and
+// summed over thousands of positions, so the ACCUMULATOR sets the error, not the
+// operand. Nothing else narrows — see the note on mla_kv_cache in models/kimi_k3.h.
+//
+// q:       [key_length, n_head]     (output of mla_absorb_q_f32), f32
+// k_cache: [key_length, n_ctx]      token-major rows; MQA (one K shared by heads), f16
+// wv_b:    [kv_lora, v_dim, n_head]  kv_lora fastest, f32
+// out:     [v_dim, n_head]           f32
+void mla_decode_attn_f32(float* out, const float* q, const __half* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
                          int v_dim, int n_head, int n_ctx, float scale,
                          cudaStream_t stream);
+
+// Write one KV-cache row: convert `n_a` floats from `a` and `n_b` floats from `b`
+// into consecutive __half slots at `row`. Replaces the two device-to-device copies
+// the f32 cache used, and is the ONLY place a value narrows.
+void mla_kv_store_row_f16(__half* row, const float* a, int n_a,
+                          const float* b, int n_b, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // 14. Generic projection (GEMV), f32 activation in, f32 out

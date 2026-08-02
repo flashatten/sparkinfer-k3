@@ -606,6 +606,21 @@ static void test_mla_decode_attn(int n_ctx, int H) {
     auto k_cache = rnd((size_t)key_length * n_ctx, rng);
     auto wv_b = rnd((size_t)kv_lora * v_dim * H, rng, -0.2f, 0.2f);
 
+    // THE CACHE IS HALF, SO THE REFERENCE READS HALF TOO.
+    //
+    // Round-tripping the host copy through __half before the float64 reference runs
+    // is what keeps this test measuring the KERNEL and not the storage format. If the
+    // reference kept the f32 values, every comparison below would be dominated by the
+    // ~1e-3 relative cost of narrowing the cache — a number this test cannot
+    // usefully bound, and one that belongs to an end-to-end KLD against llama.cpp
+    // rather than to a kernel test. With both sides reading identical values, the
+    // tolerance still pins the online-softmax rescale and the combine at f32.
+    std::vector<__half> k_cache_h((size_t)key_length * n_ctx);
+    for (size_t i = 0; i < k_cache.size(); ++i) {
+        k_cache_h[i] = __float2half(k_cache[i]);
+        k_cache[i]   = __half2float(k_cache_h[i]);
+    }
+
     auto run_ref = [&](double sc) {
         std::vector<double> out((size_t)v_dim * H, 0.0);
         for (int h = 0; h < H; ++h) {
@@ -647,7 +662,8 @@ static void test_mla_decode_attn(int n_ctx, int H) {
     auto wrong = run_ref(wrong_scale);
     assert_variant_differs(ref, wrong, "vs scale=1/sqrt(key_length=80)");
 
-    float *dq = to_dev(q), *dk = to_dev(k_cache), *dw = to_dev(wv_b), *dout = nullptr;
+    float *dq = to_dev(q), *dw = to_dev(wv_b), *dout = nullptr;
+    __half* dk = to_dev(k_cache_h);
     CU(cudaMalloc(&dout, (size_t)v_dim * H * sizeof(float)));
     mla_decode_attn_f32(dout, dq, dk, dw, key_length, kv_lora, v_dim, H, n_ctx, scale, 0);
     CU(cudaDeviceSynchronize());

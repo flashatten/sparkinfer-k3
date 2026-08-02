@@ -1511,7 +1511,7 @@ static inline int k3_sm_count(int dev) {
 template <int BLOCK>
 __global__ void mla_decode_attn_kernel(float* __restrict__ out,
                                        const float* __restrict__ q,
-                                       const float* __restrict__ k_cache,
+                                       const __half* __restrict__ k_cache,
                                        const float* __restrict__ wv_b,
                                        int key_length, int kv_lora, int v_dim,
                                        int n_ctx, float scale) {
@@ -1543,9 +1543,9 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
 
         // --- score the tile: one warp per token, lanes stride over d ---
         for (int t = warp; t < tn; t += NWARP) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const __half* kt = k_cache + (size_t)(t0 + t) * key_length;
             float s = 0.0f;
-            for (int d = lane; d < key_length; d += 32) s += s_q[d] * kt[d];
+            for (int d = lane; d < key_length; d += 32) s += s_q[d] * __half2float(kt[d]);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 s += __shfl_down_sync(0xffffffff, s, off);
@@ -1578,7 +1578,7 @@ __global__ void mla_decode_attn_kernel(float* __restrict__ out,
         for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
             float a = s_acc[r] * corr;
             for (int t = 0; t < tn; ++t)
-                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+                a += s_p[t] * __half2float(k_cache[(size_t)(t0 + t) * key_length + r]);
             s_acc[r] = a;
         }
         __syncthreads();
@@ -1719,7 +1719,7 @@ template <int BLOCK>
 __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
                                              float* __restrict__ part_ml,
                                              const float* __restrict__ q,
-                                             const float* __restrict__ k_cache,
+                                             const __half* __restrict__ k_cache,
                                              int key_length, int kv_lora,
                                              int n_ctx, float scale, int splits) {
     constexpr int NWARP = BLOCK / 32;
@@ -1751,9 +1751,9 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         const int tn = min(kMlaCtxTile, t_end - t0);
 
         for (int t = warp; t < tn; t += NWARP) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const __half* kt = k_cache + (size_t)(t0 + t) * key_length;
             float sdot = 0.0f;
-            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * kt[d];
+            for (int d = lane; d < key_length; d += 32) sdot += s_q[d] * __half2float(kt[d]);
 #pragma unroll
             for (int off = 16; off > 0; off >>= 1)
                 sdot += __shfl_down_sync(0xffffffff, sdot, off);
@@ -1781,7 +1781,7 @@ __global__ void mla_decode_attn_split_kernel(float* __restrict__ part_acc,
         for (int r = threadIdx.x; r < kv_lora; r += BLOCK) {
             float a = s_acc[r] * corr;
             for (int t = 0; t < tn; ++t)
-                a += s_p[t] * k_cache[(size_t)(t0 + t) * key_length + r];
+                a += s_p[t] * __half2float(k_cache[(size_t)(t0 + t) * key_length + r]);
             s_acc[r] = a;
         }
         __syncthreads();
@@ -1829,7 +1829,7 @@ template <int BLOCK, int HPB, int RSLOTS, int TPW = kMlaTokensPerWarp>
 __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
                                               float* __restrict__ part_ml,
                                               const float* __restrict__ q,
-                                              const float* __restrict__ k_cache,
+                                              const __half* __restrict__ k_cache,
                                               int key_length, int kv_lora,
                                               int n_ctx, float scale, int splits) {
     constexpr int NWARP = BLOCK / 32;
@@ -1880,7 +1880,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             // The tail duplicates the last row rather than branching: the extra lanes
             // compute a score that is never stored, and every load stays in bounds.
             const int tc = min(TPW, tn - tb);
-            const float* kt[TPW];
+            const __half* kt[TPW];
 #pragma unroll
             for (int tt = 0; tt < TPW; ++tt)
                 kt[tt] = k_cache + (size_t)(t0 + tb + min(tt, tc - 1)) * key_length;
@@ -1889,7 +1889,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             for (int d = lane; d < key_length; d += 32) {
                 float kv[TPW];
 #pragma unroll
-                for (int tt = 0; tt < TPW; ++tt) kv[tt] = kt[tt][d];
+                for (int tt = 0; tt < TPW; ++tt) kv[tt] = __half2float(kt[tt][d]);
 #pragma unroll
                 for (int hh = 0; hh < HPB; ++hh) {
                     const float qv = s_q[hh * key_length + d];
@@ -1961,7 +1961,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
 
 #pragma unroll 4
         for (int t = 0; t < tn; ++t) {
-            const float* kt = k_cache + (size_t)(t0 + t) * key_length;
+            const __half* kt = k_cache + (size_t)(t0 + t) * key_length;
             float p[HPB];
 #pragma unroll
             for (int hh = 0; hh < HPB; ++hh) p[hh] = s_p[hh * kMlaCtxTile + t];
@@ -1969,7 +1969,7 @@ __global__ void mla_decode_attn_hbatch_kernel(float* __restrict__ part_acc,
             for (int u = 0; u < RSLOTS; ++u) {
                 const int r = threadIdx.x + u * BLOCK;
                 if (r < kv_lora) {
-                    const float kv = kt[r];
+                    const float kv = __half2float(kt[r]);
 #pragma unroll
                     for (int hh = 0; hh < HPB; ++hh) acc[u][hh] += p[hh] * kv;
                 }
@@ -2918,7 +2918,7 @@ void mla_absorb_q_f32(float* out, const float* q_nope, const float* q_pe,
         out, q_nope, q_pe, wk_b, qk_nope, kv_lora, rope_dim);
 }
 
-void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
+void mla_decode_attn_f32(float* out, const float* q, const __half* k_cache,
                          const float* wv_b, int key_length, int kv_lora,
                          int v_dim, int n_head, int n_ctx, float scale,
                          cudaStream_t stream) {
@@ -2981,7 +2981,13 @@ void mla_decode_attn_f32(float* out, const float* q, const float* k_cache,
         if (sm > 0) {
             const int fill      = (kMlaBlocksPerSm * sm + groups - 1) / groups;
             const int min_slice = k3_mla_min_slice_len(hpb, key_length, kv_lora);
-            const int by_len    = std::max(1, n_ctx / min_slice);
+            // CEILING, not floor: the bench seeks to n_ctx 131,039, which is not a
+            // multiple of the floor. Flooring gives 255 slices of 514 tokens — four
+            // whole tiles plus a fifth carrying two tokens, 1,275 tile executions
+            // against an ideal 1,024. Rounding up gives 256 slices of exactly 512.
+            // A no-op at every exact multiple, so it cannot move a shape that
+            // already divided evenly.
+            const int by_len    = (n_ctx + min_slice - 1) / min_slice;
             splits = std::max(splits, std::min(fill, by_len));
             splits = std::min(std::max(splits, 1), k3_mla_max_splits(n_head));
         }
@@ -3365,6 +3371,27 @@ void k3_add_f32(float* out, const float* a, const float* b, int64_t n,
     const int T = 256;
     const int64_t blocks = (n + T - 1) / T;
     add_f32_kernel<<<(unsigned)blocks, T, 0, stream>>>(out, a, b, n);
+}
+
+// ONE launch, not two, and one kernel rather than two device-to-device copies. The
+// f32 cache wrote this row with a pair of cudaMemcpyAsync; a half cache cannot,
+// because the value has to be converted on the way in. Both source ranges are
+// written by the same launch so the row is never half-updated between them.
+__global__ void mla_kv_store_row_f16_kernel(__half* __restrict__ row,
+                                            const float* __restrict__ a, int n_a,
+                                            const float* __restrict__ b, int n_b) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_a)             row[i]       = __float2half(a[i]);
+    else if (i < n_a + n_b)  row[i]       = __float2half(b[i - n_a]);
+}
+
+void mla_kv_store_row_f16(__half* row, const float* a, int n_a,
+                          const float* b, int n_b, cudaStream_t stream) {
+    const int n = n_a + n_b;
+    if (n <= 0) return;
+    const int T = 128;
+    mla_kv_store_row_f16_kernel<<<(unsigned)((n + T - 1) / T), T, 0, stream>>>(
+        row, a, n_a, b, n_b);
 }
 
 void sigmoid_inplace_f32(float* x, int64_t n, cudaStream_t stream) {

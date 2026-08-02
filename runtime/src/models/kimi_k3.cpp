@@ -621,6 +621,12 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
         out.owned.push_back(p);
         return (float*)p;
     };
+    auto alloc_h = [&](size_t n_halves) -> __half* {
+        void* p = nullptr;
+        if (cudaMalloc(&p, n_halves * sizeof(__half)) != cudaSuccess) return nullptr;
+        out.owned.push_back(p);
+        return (__half*)p;
+    };
 
     // The state vectors stay indexed by GLOBAL ordinal (kimi_k3_kda_ordinal /
     // kimi_k3_mla_ordinal), so they keep their full length — but only the slots for
@@ -647,7 +653,7 @@ bool kimi_k3_alloc_state(const KimiK3Config& cfg, int max_ctx, KimiK3RuntimeStat
                 return false;
         } else {
             const int k = kimi_k3_mla_ordinal(cfg, layer);
-            out.mla_kv_cache[k] = alloc((size_t)cfg.key_length * max_ctx);
+            out.mla_kv_cache[k] = alloc_h((size_t)cfg.key_length * max_ctx);
             if (!out.mla_kv_cache[k]) return false;
         }
     }
@@ -676,7 +682,11 @@ void kimi_k3_reset_state(KimiK3RuntimeState& s) {
     for (float* p : s.conv_state_k) z(p, (size_t)s.conv_state_elems);
     for (float* p : s.conv_state_v) z(p, (size_t)s.conv_state_elems);
     for (float* p : s.delta_state)  z(p, (size_t)s.delta_state_elems);
-    for (float* p : s.mla_kv_cache) z(p, (size_t)s.kv_cache_elems);
+    // Half-width, so this one zeroes by its OWN element size rather than the lambda's.
+    // Zeroing kv_cache_elems FLOATS here would run twice past the end of the cache.
+    for (__half* p : s.mla_kv_cache)
+        if (p && s.kv_cache_elems > 0)
+            cudaMemset(p, 0, (size_t)s.kv_cache_elems * sizeof(__half));
     // res_bank is not zeroed — n_ckpt=0 means no row is read until pushed, and a
     // push always writes the full row before n_ckpt is incremented, so stale bytes
     // in unused rows are never observed.
@@ -1194,13 +1204,13 @@ bool kimi_k3_forward_layer_phase(KimiK3Forward& fwd, int layer, K3LayerPhase pha
                               stream);
             if (fwd.debug) fwd.debug("dbg_kvcmpr", layer, s.kv_cmpr_normed, cfg.kv_lora_rank);
 
-            // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe).
-            float* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
-            cudaMemcpyAsync(row, s.kv_cmpr_normed, (size_t)cfg.kv_lora_rank * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
-            cudaMemcpyAsync(row + cfg.kv_lora_rank, s.kv_a_out + cfg.kv_lora_rank,
-                            (size_t)cfg.rope_dim * sizeof(float),
-                            cudaMemcpyDeviceToDevice, stream);
+            // K-cache row for this position: concat(normed kv_cmpr, RAW k_pe),
+            // narrowed to half on the way in. One launch replaces the two D2D copies
+            // the f32 cache used; everything that produced these values stayed f32.
+            __half* row = st.mla_kv_cache[mla_ord] + (size_t)st.position * cfg.key_length;
+            k3k::mla_kv_store_row_f16(row, s.kv_cmpr_normed, cfg.kv_lora_rank,
+                                      s.kv_a_out + cfg.kv_lora_rank, cfg.rope_dim,
+                                      stream);
 
             if (!L.attn_k_b.ok() || !L.attn_v_b.ok()) return false;
             k3k::mla_absorb_q_f32(s.absorbed_q, s.q_nope, s.q_pe,

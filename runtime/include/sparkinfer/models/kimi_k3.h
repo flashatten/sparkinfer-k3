@@ -41,6 +41,7 @@
 #include <string>
 #include <vector>
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace sparkinfer {
@@ -282,7 +283,20 @@ struct KimiK3RuntimeState {
     std::vector<float*> delta_state;                               // [head_dim, head_dim, n_head]
 
     // Indexed by MLA-layer ordinal (0..n_mla_layers-1).
-    std::vector<float*> mla_kv_cache;   // [key_length, max_ctx]
+    // [key_length, max_ctx] in HALF, not float. This is the model's largest live
+    // buffer and its largest per-token read: 576 * 131,072 * 2 B = 151 MB per MLA
+    // layer, and every token streams all of it — the score pass reads key_length per
+    // position and the latent pass re-reads the leading kv_lora of the same rows.
+    // At f32 that was 13.7 GB per token per rank across 24 layers.
+    //
+    // WHY THE CACHE AND NOTHING ELSE. Everything upstream stays f32: the latent is
+    // computed, rms-normed and reduced in f32, and only the STORE narrows. So the
+    // width is spent once, on a value that is about to be multiplied by a softmax
+    // weight and summed over thousands of positions — where the accumulator, not the
+    // operand, sets the error. The residual stream, the collectives and every
+    // projection are untouched, which is the distinction kimi_k3.h's f32-end-to-end
+    // note is protecting.
+    std::vector<__half*> mla_kv_cache;
 
     // Shared across the whole model — one bank, not one per layer.
     float* res_bank = nullptr;   // [hidden, max_ckpt]
